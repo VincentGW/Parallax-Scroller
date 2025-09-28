@@ -6,6 +6,7 @@
 #include <cmath>
 #include <map>
 #include <algorithm>
+#include <unordered_map>
 
 const int TILE_SIZE = 256;
 const int STRIP_HEIGHT = 128;
@@ -24,13 +25,213 @@ int ZENITH_END_Y;
 const float BASE_SCROLL_SPEED = 50.0f;
 const float SCROLL_SPEED_COEFFICIENT = 0.5f; // Controls how much faster each layer gets
 
+// Helper function to convert sf::Color to uint32_t for map keys
+uint32_t colorToKey(const sf::Color& color) {
+    return (color.r << 24) | (color.g << 16) | (color.b << 8) | color.a;
+}
+
+class PaletteManager {
+private:
+    std::vector<std::vector<std::vector<sf::Color>>> swatches; // [swatchIndex][rowIndex][frameIndex]
+    std::map<uint32_t, std::pair<int, int>> colorToSwatchPosition; // Maps tile color to (swatchIndex, rowIndex)
+    std::vector<int> currentSwatchFrames; // Current frame for each swatch
+    std::vector<float> swatchTimers; // Timer for each swatch
+
+public:
+    bool loadSwatches(const std::string& swatchDirectory) {
+        swatches.clear();
+        colorToSwatchPosition.clear();
+        currentSwatchFrames.clear();
+        swatchTimers.clear();
+
+        try {
+            if (std::filesystem::exists(swatchDirectory) && std::filesystem::is_directory(swatchDirectory)) {
+                std::vector<std::string> swatchFiles;
+
+                // Get all PNG files in swatch directory
+                for (const auto& entry : std::filesystem::directory_iterator(swatchDirectory)) {
+                    if (entry.is_regular_file()) {
+                        std::string extension = entry.path().extension().string();
+                        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+                        if (extension == ".png") {
+                            swatchFiles.push_back(entry.path().string());
+                        }
+                    }
+                }
+
+                std::sort(swatchFiles.begin(), swatchFiles.end());
+
+                for (const auto& swatchFile : swatchFiles) {
+                    sf::Image swatchImage;
+                    if (swatchImage.loadFromFile(swatchFile)) {
+                        std::vector<std::vector<sf::Color>> swatchRows;
+                        unsigned int width = swatchImage.getSize().x;
+                        unsigned int height = swatchImage.getSize().y;
+
+                        // Read colors from swatch (multi-row support)
+                        for (unsigned int y = 0; y < height; y++) {
+                            std::vector<sf::Color> row;
+                            for (unsigned int x = 0; x < width; x++) {
+                                sf::Color color = swatchImage.getPixel(x, y);
+                                row.push_back(color);
+                            }
+                            if (!row.empty()) {
+                                swatchRows.push_back(row);
+                            }
+                        }
+
+                        if (!swatchRows.empty()) {
+                            int swatchIndex = swatches.size();
+
+                            // Map the first color in each row to this swatch position
+                            for (int rowIndex = 0; rowIndex < static_cast<int>(swatchRows.size()); rowIndex++) {
+                                if (!swatchRows[rowIndex].empty()) {
+                                    sf::Color firstColor = swatchRows[rowIndex][0];
+                                    colorToSwatchPosition[colorToKey(firstColor)] = std::make_pair(swatchIndex, rowIndex);
+                                }
+                            }
+
+                            swatches.push_back(swatchRows);
+                            currentSwatchFrames.push_back(0);
+                            swatchTimers.push_back(0.0f);
+
+                            std::cout << "Loaded swatch: " << swatchFile << " with " << swatchRows.size() << " rows, ";
+                            if (!swatchRows.empty()) {
+                                std::cout << swatchRows[0].size() << " frames per row" << std::endl;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (const std::filesystem::filesystem_error& ex) {
+            std::cerr << "Filesystem error loading swatches: " << ex.what() << std::endl;
+            return false;
+        }
+
+        return !swatches.empty();
+    }
+
+    void updateSwatches(float deltaTime) {
+        for (size_t i = 0; i < swatches.size(); i++) {
+            // Skip if no rows or only single frame per row
+            if (swatches[i].empty() || (swatches[i].size() > 0 && swatches[i][0].size() <= 1)) continue;
+
+            swatchTimers[i] += deltaTime;
+
+            // Check if current frame is frame 0 (hold for 3 seconds)
+            if (currentSwatchFrames[i] == 0) {
+                if (swatchTimers[i] >= 3.0f) {
+                    currentSwatchFrames[i] = 1;
+                    swatchTimers[i] = 0.0f;
+                }
+            } else {
+                // Normal frame timing (0.2 seconds per frame)
+                if (swatchTimers[i] >= 0.2f) {
+                    currentSwatchFrames[i]++;
+                    swatchTimers[i] = 0.0f;
+
+                    // Loop back to frame 0 when we reach the end (check first row for frame count)
+                    if (!swatches[i].empty() && currentSwatchFrames[i] >= static_cast<int>(swatches[i][0].size())) {
+                        currentSwatchFrames[i] = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    sf::Image applyPalettes(const sf::Image& baseImage) {
+        sf::Image result = baseImage;
+        sf::Vector2u size = baseImage.getSize();
+
+        for (unsigned int x = 0; x < size.x; x++) {
+            for (unsigned int y = 0; y < size.y; y++) {
+                sf::Color originalColor = baseImage.getPixel(x, y);
+                uint32_t colorKey = colorToKey(originalColor);
+
+                // Check if this color maps to a swatch position
+                auto it = colorToSwatchPosition.find(colorKey);
+                if (it != colorToSwatchPosition.end()) {
+                    int swatchIndex = it->second.first;
+                    int rowIndex = it->second.second;
+                    int currentFrame = currentSwatchFrames[swatchIndex];
+
+                    if (swatchIndex < static_cast<int>(swatches.size()) &&
+                        rowIndex < static_cast<int>(swatches[swatchIndex].size()) &&
+                        currentFrame < static_cast<int>(swatches[swatchIndex][rowIndex].size())) {
+                        sf::Color newColor = swatches[swatchIndex][rowIndex][currentFrame];
+                        result.setPixel(x, y, newColor);
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    bool hasSwatches() const {
+        return !swatches.empty();
+    }
+
+    bool loadPalettes(const std::string& paletteDirectory) {
+        return loadSwatches(paletteDirectory);
+    }
+
+    std::vector<std::vector<sf::Color>>& getCurrentSwatch() {
+        static std::vector<std::vector<sf::Color>> defaultSwatch;
+        if (!swatches.empty()) {
+            return swatches[0]; // Return first swatch for now
+        }
+        return defaultSwatch;
+    }
+
+    int getCurrentFrame() const {
+        if (!currentSwatchFrames.empty()) {
+            return currentSwatchFrames[0]; // Return first swatch's current frame
+        }
+        return 0;
+    }
+
+    void applyPalette(sf::Image& image, int frameIndex) {
+        sf::Vector2u size = image.getSize();
+
+        for (unsigned int x = 0; x < size.x; x++) {
+            for (unsigned int y = 0; y < size.y; y++) {
+                sf::Color originalColor = image.getPixel(x, y);
+                uint32_t colorKey = colorToKey(originalColor);
+
+                // Check if this color maps to a swatch position
+                auto it = colorToSwatchPosition.find(colorKey);
+                if (it != colorToSwatchPosition.end()) {
+                    int swatchIndex = it->second.first;
+                    int rowIndex = it->second.second;
+
+                    if (swatchIndex < static_cast<int>(swatches.size()) &&
+                        rowIndex < static_cast<int>(swatches[swatchIndex].size()) &&
+                        frameIndex < static_cast<int>(swatches[swatchIndex][rowIndex].size())) {
+                        sf::Color newColor = swatches[swatchIndex][rowIndex][frameIndex];
+                        image.setPixel(x, y, newColor);
+                    }
+                }
+            }
+        }
+    }
+};
+
 class ParallaxLayer {
 private:
-    // Each tile can have multiple animation frames
+    // Frame-based animation system
     std::vector<std::vector<sf::Texture>> tileAnimations; // [tileIndex][frameIndex]
     std::vector<std::vector<sf::Sprite>> tileSprites;     // [tileIndex][frameIndex]
     std::vector<int> currentFrames;  // Current frame for each tile
     std::vector<float> animationTimers; // Timer for each tile's animation
+
+    // Palette system integration
+    std::vector<std::vector<sf::Image>> baseTileImages; // [tileIndex][frameIndex] - source images for palette application
+    std::vector<std::vector<sf::Texture>> palettedTextures; // [tileIndex][frameIndex] - textures with palettes applied
+    std::vector<std::vector<sf::Sprite>> palettedSprites; // [tileIndex][frameIndex] - sprites for palette rendering
+    PaletteManager paletteManager;
+    bool usePalettes;
+
     float scrollOffset;
     float scrollSpeed;
     int yPosition;
@@ -40,19 +241,52 @@ private:
 
 public:
     ParallaxLayer(float speed, int y, int h)
-        : scrollOffset(0), scrollSpeed(speed), yPosition(y), height(h), hasTextures(false) {
+        : scrollOffset(0), scrollSpeed(speed), yPosition(y), height(h), hasTextures(false), usePalettes(false) {
         sourceRect = sf::IntRect(0, 0, TILE_SIZE, height);
     }
 
-    bool loadTextures(const std::vector<std::vector<std::string>>& tileFrameFiles, int stripIndex = -1) {
+    bool loadTextures(const std::vector<std::vector<std::string>>& tileFrameFiles, const std::string& layerName, int stripIndex = -1) {
         tileAnimations.clear();
         tileSprites.clear();
         currentFrames.clear();
         animationTimers.clear();
+        baseTileImages.clear();
+        palettedTextures.clear();
+
+        // Load layer-specific palettes
+        std::string paletteDir = "assets/tiles/" + layerName + "/palettes";
+        usePalettes = paletteManager.loadPalettes(paletteDir);
 
         for (const auto& frameFiles : tileFrameFiles) {
             std::vector<sf::Texture> frameTextures;
             std::vector<sf::Sprite> frameSprites;
+
+            // Load base image for palette application if using palettes
+            sf::Image baseImage;
+            bool hasBaseImage = false;
+            if (usePalettes && !frameFiles.empty() && paletteManager.hasSwatches()) {
+                sf::Texture tempTexture;
+                if (tempTexture.loadFromFile(frameFiles[0])) {
+                    baseImage = tempTexture.copyToImage();
+
+                    // Apply source rectangle to base image if needed
+                    if (stripIndex >= 0) {
+                        int stripHeight = height;
+                        sf::IntRect rect(0, stripIndex * stripHeight, TILE_SIZE, stripHeight);
+                        sf::Image croppedImage;
+                        croppedImage.create(rect.width, rect.height);
+                        for (int x = 0; x < rect.width; x++) {
+                            for (int y = 0; y < rect.height; y++) {
+                                croppedImage.setPixel(x, y, baseImage.getPixel(rect.left + x, rect.top + y));
+                            }
+                        }
+                        baseImage = croppedImage;
+                    }
+
+                    baseTileImages.push_back({baseImage});
+                    hasBaseImage = true;
+                }
+            }
 
             for (const auto& filename : frameFiles) {
                 sf::Texture texture;
@@ -98,6 +332,23 @@ public:
                 tileSprites.push_back(std::move(frameSprites));
                 currentFrames.push_back(0); // Start at frame 0
                 animationTimers.push_back(0.0f); // Start timer at 0
+
+                // Create palette textures if using palettes
+                if (hasBaseImage && paletteManager.hasSwatches()) {
+                    std::vector<sf::Texture> paletteTextures;
+                    auto& currentSwatch = paletteManager.getCurrentSwatch();
+
+                    for (size_t col = 0; col < currentSwatch[0].size(); col++) {
+                        sf::Image paletteImage = baseImage;
+                        paletteManager.applyPalette(paletteImage, col);
+
+                        sf::Texture paletteTexture;
+                        paletteTexture.loadFromImage(paletteImage);
+                        paletteTextures.push_back(std::move(paletteTexture));
+                    }
+
+                    palettedTextures.push_back(std::move(paletteTextures));
+                }
             }
         }
 
@@ -110,6 +361,11 @@ public:
     }
 
     void update(float deltaTime, bool scrollLeft, bool scrollRight) {
+        // Update palette manager if using palettes
+        if (usePalettes) {
+            paletteManager.updateSwatches(deltaTime);
+        }
+
         if (scrollLeft) {
             scrollOffset -= scrollSpeed * deltaTime;
         }
@@ -170,19 +426,34 @@ public:
 
                 // Only draw if visible on screen
                 if (xPos + TILE_SIZE >= 0 && xPos <= SCREEN_WIDTH) {
-                    // Get the current frame for this tile
-                    int currentFrame = currentFrames[tileInPattern];
-                    if (currentFrame < static_cast<int>(tileSprites[tileInPattern].size())) {
-                        sf::Sprite renderSprite = tileSprites[tileInPattern][currentFrame];
-                        renderSprite.setPosition(xPos, (float)yPosition);
-                        window.draw(renderSprite);
+                    sf::Sprite renderSprite;
+
+                    if (usePalettes && !palettedTextures.empty() &&
+                        tileInPattern < static_cast<int>(palettedTextures.size()) &&
+                        paletteManager.hasSwatches()) {
+                        // Use palette-based rendering
+                        int paletteFrame = paletteManager.getCurrentFrame();
+                        if (paletteFrame < static_cast<int>(palettedTextures[tileInPattern].size())) {
+                            renderSprite.setTexture(palettedTextures[tileInPattern][paletteFrame]);
+                            renderSprite.setTextureRect(sf::IntRect(0, 0, TILE_SIZE, height));
+                        }
+                    } else {
+                        // Use frame-based rendering
+                        int currentFrame = currentFrames[tileInPattern];
+                        if (currentFrame < static_cast<int>(tileSprites[tileInPattern].size())) {
+                            renderSprite = tileSprites[tileInPattern][currentFrame];
+                        }
                     }
+
+                    renderSprite.setPosition(xPos, (float)yPosition);
+                    window.draw(renderSprite);
                 }
             }
         }
     }
 
     float getScrollSpeed() const { return scrollSpeed; }
+    void setScrollSpeed(float speed) { scrollSpeed = speed; }
     int getYPosition() const { return yPosition; }
     bool getHasTextures() const { return hasTextures; }
 };
@@ -195,14 +466,18 @@ private:
     // Auto-scroll state
     enum class AutoScrollState {
         STOPPED,
-        SCROLLING_RIGHT,
-        SCROLLING_LEFT
+        SCROLLING
     };
     AutoScrollState autoScrollState;
-    int autoScrollCycle; // 0=stop, 1=right, 2=stop, 3=left (cycles 0-3)
+
+    // Runtime speed controls
+    float currentBaseSpeed;
+    float currentSpeedCoefficient;
+    bool scrollingRight; // true = right, false = left
 
 public:
-    ParallaxScroller(sf::RenderWindow& win) : window(win), autoScrollState(AutoScrollState::STOPPED), autoScrollCycle(0) {
+    ParallaxScroller(sf::RenderWindow& win) : window(win), autoScrollState(AutoScrollState::SCROLLING),
+                      currentBaseSpeed(BASE_SCROLL_SPEED), currentSpeedCoefficient(SCROLL_SPEED_COEFFICIENT), scrollingRight(true) {
         initializeLayers();
         loadTiles();
     }
@@ -277,7 +552,7 @@ public:
         if (!aboveAnimations.empty()) {
             for (int i = 0; i < STRIPS_PER_TILE; i++) {
                 if (layerIndex < layers.size()) {
-                    layers[layerIndex].loadTextures(aboveAnimations, STRIPS_PER_TILE - 1 - i); // above, strips in reverse order
+                    layers[layerIndex].loadTextures(aboveAnimations, "above", STRIPS_PER_TILE - 1 - i); // above, strips in reverse order
                 }
                 layerIndex++;
             }
@@ -287,7 +562,7 @@ public:
         if (!topAnimations.empty()) {
             for (int i = 0; i < SMALL_STRIPS_PER_TILE; i++) {
                 if (layerIndex < layers.size()) {
-                    layers[layerIndex].loadTextures(topAnimations, SMALL_STRIPS_PER_TILE - 1 - i); // top, strips in reverse order
+                    layers[layerIndex].loadTextures(topAnimations, "top", SMALL_STRIPS_PER_TILE - 1 - i); // top, strips in reverse order
                 }
                 layerIndex++;
             }
@@ -295,7 +570,7 @@ public:
 
         // Load zenith layer (full tile)
         if (!zenithAnimations.empty() && layerIndex < layers.size()) {
-            layers[layerIndex].loadTextures(zenithAnimations); // Full zenith tiles
+            layers[layerIndex].loadTextures(zenithAnimations, "zenith"); // Full zenith tiles
         }
         layerIndex++;
 
@@ -303,7 +578,7 @@ public:
         if (!belowAnimations.empty()) {
             for (int i = 0; i < STRIPS_PER_TILE; i++) {
                 if (layerIndex < layers.size()) {
-                    layers[layerIndex].loadTextures(belowAnimations, i); // below, strips in normal order
+                    layers[layerIndex].loadTextures(belowAnimations, "below", i); // below, strips in normal order
                 }
                 layerIndex++;
             }
@@ -313,7 +588,7 @@ public:
         if (!bottomAnimations.empty()) {
             for (int i = 0; i < SMALL_STRIPS_PER_TILE; i++) {
                 if (layerIndex < layers.size()) {
-                    layers[layerIndex].loadTextures(bottomAnimations, i); // bottom, strips in normal order
+                    layers[layerIndex].loadTextures(bottomAnimations, "bottom", i); // bottom, strips in normal order
                 }
                 layerIndex++;
             }
@@ -431,49 +706,92 @@ public:
     }
 
     void toggleAutoScroll() {
-        autoScrollCycle = (autoScrollCycle + 1) % 4;
-
-        switch (autoScrollCycle) {
-            case 0:
-                autoScrollState = AutoScrollState::STOPPED;
-                std::cout << "Auto-scroll: STOPPED" << std::endl;
-                break;
-            case 1:
-                autoScrollState = AutoScrollState::SCROLLING_RIGHT;
-                std::cout << "Auto-scroll: SCROLLING RIGHT" << std::endl;
-                break;
-            case 2:
-                autoScrollState = AutoScrollState::STOPPED;
-                std::cout << "Auto-scroll: STOPPED" << std::endl;
-                break;
-            case 3:
-                autoScrollState = AutoScrollState::SCROLLING_LEFT;
-                std::cout << "Auto-scroll: SCROLLING LEFT" << std::endl;
-                break;
+        if (autoScrollState == AutoScrollState::SCROLLING) {
+            autoScrollState = AutoScrollState::STOPPED;
+            std::cout << "Auto-scroll: STOPPED" << std::endl;
+        } else {
+            autoScrollState = AutoScrollState::SCROLLING;
+            std::cout << "Auto-scroll: SCROLLING" << std::endl;
         }
     }
 
-    void update(float deltaTime, bool scrollLeft, bool scrollRight) {
-        // Override manual scroll input with auto-scroll state
-        bool finalScrollLeft = scrollLeft;
-        bool finalScrollRight = scrollRight;
+    void updateLayerSpeeds() {
+        int layerIndex = 0;
+        int aboveStrips = STRIPS_PER_TILE;
+        int topStrips = SMALL_STRIPS_PER_TILE;
+        int belowStrips = STRIPS_PER_TILE;
+        int bottomStrips = SMALL_STRIPS_PER_TILE;
 
+        // Update above layer speeds
+        for (int i = 0; i < aboveStrips && layerIndex < layers.size(); i++, layerIndex++) {
+            float speedMultiplier = 1.0f + (i + 1) * currentSpeedCoefficient;
+            layers[layerIndex].setScrollSpeed(currentBaseSpeed * speedMultiplier);
+        }
+
+        // Update top layer speeds
+        for (int i = 0; i < topStrips && layerIndex < layers.size(); i++, layerIndex++) {
+            float speedMultiplier = 1.0f + (aboveStrips + i + 1) * currentSpeedCoefficient;
+            layers[layerIndex].setScrollSpeed(currentBaseSpeed * speedMultiplier);
+        }
+
+        // Update zenith layer speed
+        if (layerIndex < layers.size()) {
+            layers[layerIndex].setScrollSpeed(currentBaseSpeed);
+            layerIndex++;
+        }
+
+        // Update below layer speeds
+        for (int i = 0; i < belowStrips && layerIndex < layers.size(); i++, layerIndex++) {
+            float speedMultiplier = 1.0f + (i + 1) * currentSpeedCoefficient;
+            layers[layerIndex].setScrollSpeed(currentBaseSpeed * speedMultiplier);
+        }
+
+        // Update bottom layer speeds
+        for (int i = 0; i < bottomStrips && layerIndex < layers.size(); i++, layerIndex++) {
+            float speedMultiplier = 1.0f + (belowStrips + i + 1) * currentSpeedCoefficient;
+            layers[layerIndex].setScrollSpeed(currentBaseSpeed * speedMultiplier);
+        }
+    }
+
+    void update(float deltaTime, bool leftKey, bool rightKey, bool upKey, bool downKey) {
+        // Handle direction and speed controls
+        if (leftKey) {
+            scrollingRight = false;
+            std::cout << "Direction: LEFT" << std::endl;
+        }
+        if (rightKey) {
+            scrollingRight = true;
+            std::cout << "Direction: RIGHT" << std::endl;
+        }
+        if (downKey) {
+            currentBaseSpeed = std::max(0.1f, currentBaseSpeed - 50.0f * deltaTime);
+            updateLayerSpeeds();
+            std::cout << "Base Speed: " << currentBaseSpeed << std::endl;
+        }
+        if (upKey) {
+            currentBaseSpeed = std::min(500.0f, currentBaseSpeed + 50.0f * deltaTime);
+            updateLayerSpeeds();
+            std::cout << "Base Speed: " << currentBaseSpeed << std::endl;
+        }
+
+        // Determine scrolling behavior
+        bool shouldScrollLeft = false;
+        bool shouldScrollRight = false;
         switch (autoScrollState) {
-            case AutoScrollState::SCROLLING_RIGHT:
-                finalScrollLeft = false;
-                finalScrollRight = true;
-                break;
-            case AutoScrollState::SCROLLING_LEFT:
-                finalScrollLeft = true;
-                finalScrollRight = false;
+            case AutoScrollState::SCROLLING:
+                if (scrollingRight) {
+                    shouldScrollRight = true;
+                } else {
+                    shouldScrollLeft = true;
+                }
                 break;
             case AutoScrollState::STOPPED:
-                // Manual input is preserved when auto-scroll is stopped
+                // No automatic scrolling when stopped
                 break;
         }
 
         for (auto& layer : layers) {
-            layer.update(deltaTime, finalScrollLeft, finalScrollRight);
+            layer.update(deltaTime, shouldScrollLeft, shouldScrollRight);
         }
     }
 
@@ -577,12 +895,14 @@ int main() {
             }
         }
 
-        // Handle continuous key input
-        bool scrollLeft = sf::Keyboard::isKeyPressed(sf::Keyboard::Right) || sf::Keyboard::isKeyPressed(sf::Keyboard::D);
-        bool scrollRight = sf::Keyboard::isKeyPressed(sf::Keyboard::Left) || sf::Keyboard::isKeyPressed(sf::Keyboard::A);
+        // Handle continuous key input for direction and speed control
+        bool leftKey = sf::Keyboard::isKeyPressed(sf::Keyboard::Right) || sf::Keyboard::isKeyPressed(sf::Keyboard::D);
+        bool rightKey = sf::Keyboard::isKeyPressed(sf::Keyboard::Left) || sf::Keyboard::isKeyPressed(sf::Keyboard::A);
+        bool upKey = sf::Keyboard::isKeyPressed(sf::Keyboard::Up) || sf::Keyboard::isKeyPressed(sf::Keyboard::W);
+        bool downKey = sf::Keyboard::isKeyPressed(sf::Keyboard::Down) || sf::Keyboard::isKeyPressed(sf::Keyboard::S);
 
         // Update
-        scroller.update(deltaTime, scrollLeft, scrollRight);
+        scroller.update(deltaTime, leftKey, rightKey, upKey, downKey);
 
         // Render
         scroller.render();
